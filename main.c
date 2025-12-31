@@ -1,6 +1,5 @@
 #include <msp430.h>
 #include <stdint.h>
-#include <stdio.h>
 
 // ============================================================================
 //  HARDWARE ABSTRACTION LAYER (HAL) - PIN DEFINITIONS
@@ -61,53 +60,101 @@
 #define BASE_SHIFT_A        9       // alpha_base ≈ 1/512
 #define BASE_SHIFT_B        9
 
-// ---------- Delta / threshold settings ----------
+// ---------- Nonlinear delta / gain settings ----------
+// Tuned for *smaller* dips (stronger analogue signal)
 
-// How far below baseline we consider "inside a drop" (in ADC codes)
-#define DETECT_DELTA_CODES  20U     // tweak if needed
+// Below this → treated as noise
+#define DELTA_NOISE_THRESH  4U      // was 8
 
-// Minimum delta to bother estimating size (in volts, later)
-#define MIN_DV_FOR_EST      0.05f
+// From NOISE..SMALL_DELTA → small/medium-gain region
+#define SMALL_DELTA_THRESH  16U     // was 30
+
+// Gain for small/medium dips (helps 1–3 mm)
+#define SMALL_GAIN          12U     // was 7
+
+// Gain for big dips (4–10 mm etc.)
+#define DROP_GAIN           20U     // was 10
 
 // Scale 0–3.3 V ADC → 0–3.3 V DAC (AD5722 is 0–5 V)
 #define ADC_TO_DAC_NUM      33U     // 3.3
 #define ADC_TO_DAC_DEN      50U     // 5.0   => 33/50 ≈ 3.3/5
 #define DAC_MAX_CODE        4095U
 
-#define ADC_CODE_TO_VOLTS   (3.3f / 4095.0f)
-
 // ============================================================================
-//  DROP-MIN DETECTION / COMMUNICATION
+//  DROP-MIN DETECTION SETTINGS
 // ============================================================================
 
+// How far below baseline we consider "inside a drop" (in ADC codes)
+#define DETECT_DELTA_CODES  10U     // was 20 – now more sensitive
+
+// Maximum number of drops to record in RAM
 #define MAX_DROPS           256
 
-// Filter accumulators
+// ============================================================================
+//  TinyML model settings (for Channel B only)
+//  size_mm = a*ΔV^2 + b*ΔV + c, with ΔV in volts
+// ============================================================================
+#define ADC_MAX_CODE        4095U
+#define ADC_REF_VOLT        3.3f
+#define ADC_CODE_TO_VOLTS   (ADC_REF_VOLT / (float)ADC_MAX_CODE)
+
+#define MIN_DV_FOR_EST      0.05f   // ignore ultratiny dips
+
+const float DROP_A = -2.6851f;      // from your Python fit (older model)
+const float DROP_B = 10.5871f;
+const float DROP_C = -0.0380f;
+
+const float DROP_DV_MIN = 0.55f;    // calibration range (V)
+const float DROP_DV_MAX = 1.80f;
+
+// ============================================================================
+//  Filter accumulators
+// ============================================================================
+
+// Channel A: fast + baseline
 volatile uint32_t g_fast_acc_A  = 0;
 volatile uint32_t g_base_acc_A  = 0;
 
+// Channel B: two fast stages + baseline
 volatile uint32_t g_fast1_acc_B = 0;
 volatile uint32_t g_fast2_acc_B = 0;
 volatile uint32_t g_base_acc_B  = 0;
 
-// Drop-min detection state (A)
+// ============================================================================
+//  Drop-min detection state
+// ============================================================================
+
+// A-channel detection
 volatile uint8_t  g_inAnomaly_A    = 0;
 volatile uint16_t g_current_min_A  = 0xFFFF;
 volatile uint16_t g_drop_mins_A[MAX_DROPS];
 volatile uint16_t g_drop_count_A   = 0;
 
-// Drop-min detection state (B)
+// B-channel detection
 volatile uint8_t  g_inAnomaly_B    = 0;
 volatile uint16_t g_current_min_B  = 0xFFFF;
 volatile uint16_t g_drop_mins_B[MAX_DROPS];
 volatile uint16_t g_drop_count_B   = 0;
 
-// For TinyML estimator (B channel)
+// For TinyML (channel B)
 volatile uint8_t  g_drop_ready_B   = 0;
 volatile uint16_t g_last_min_B     = 0;
 volatile uint16_t g_last_base_B    = 0;
 
-// Prototypes
+// ============================================================================
+//  Green LED multi-flash state (TinyML result)
+//  We flash P1.1 N times per valid drop.
+// ============================================================================
+#define GREEN_ON_TICKS   40    // LED ON duration per flash (loop iterations)
+#define GREEN_OFF_TICKS  40    // LED OFF gap between flashes
+
+static uint8_t  g_green_flashes_remaining = 0;
+static uint16_t g_green_tick              = 0;
+static uint8_t  g_green_state             = 0; // 0=idle,1=on,2=off-between-flashes
+
+// ============================================================================
+//  Prototypes
+// ============================================================================
 void initClock(void);
 void initGPIO(void);
 void initSPI(void);
@@ -116,15 +163,13 @@ void initADC(void);
 void initTimer(void);
 void DAC_write_register(uint32_t data24);
 
-float estimate_drop_size_mm(float deltaV);
-void  handle_drop_codes(uint16_t base_code, uint16_t min_code);
+float tinyml_estimate_size_from_codes(uint16_t base_code, uint16_t min_code);
+void  schedule_green_flashes(uint8_t flashes);
 
-// ============================================================================
-//  MAIN
-// ============================================================================
+// ==================== MAIN ====================
 int main(void)
 {
-    WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog
+    WDTCTL = WDTPW | WDTHOLD;       // Stop watchdog
 
     initClock();
     initGPIO();
@@ -145,31 +190,98 @@ int main(void)
 
     while (1)
     {
-        // Process completed drops from channel B OUTSIDE the ISR
+        // --- TinyML processing for Channel B (outside ISR) ---
         if (g_drop_ready_B)
         {
             uint16_t base_code, min_code;
 
             __disable_interrupt();
-            base_code        = g_last_base_B;
-            min_code         = g_last_min_B;
-            g_drop_ready_B   = 0;
+            base_code      = g_last_base_B;
+            min_code       = g_last_min_B;
+            g_drop_ready_B = 0;
             __enable_interrupt();
 
-            handle_drop_codes(base_code, min_code);
+            float size_mm = tinyml_estimate_size_from_codes(base_code, min_code);
 
-            // Heartbeat: flash LED each processed drop
-            P1OUT ^= BIT0;
+            // Map size_mm to number of flashes:
+            // 5mm->1, 6mm->2, ..., 10mm->6
+            if (size_mm >= 5.0f && size_mm <= 10.0f)
+            {
+                uint8_t rounded = (uint8_t)(size_mm + 0.5f); // nearest integer mm
+                uint8_t flashes = 0;
+                if (rounded >= 5) flashes = (uint8_t)(rounded - 4); // 5->1, 10->6
+                if (flashes > 0)
+                    schedule_green_flashes(flashes);
+            }
         }
 
-        __no_operation();
+        // --- Green LED flash state machine (P1.1) ---
+        if (g_green_flashes_remaining == 0)
+        {
+            // No active sequence: ensure LED off
+            P1OUT &= ~BIT1;
+            g_green_state = 0;
+        }
+        else
+        {
+            if (g_green_state == 0)
+            {
+                // Start first flash: LED on
+                P1OUT |= BIT1;
+                g_green_state = 1;
+                g_green_tick  = GREEN_ON_TICKS;
+            }
+            else if (g_green_state == 1)
+            {
+                // LED currently ON
+                if (g_green_tick > 0)
+                {
+                    g_green_tick--;
+                }
+                else
+                {
+                    // End ON period
+                    P1OUT &= ~BIT1;
+                    g_green_state = 2;
+                    g_green_tick  = GREEN_OFF_TICKS;
+                }
+            }
+            else if (g_green_state == 2)
+            {
+                // OFF gap between flashes
+                if (g_green_tick > 0)
+                {
+                    g_green_tick--;
+                }
+                else
+                {
+                    // One flash complete
+                    if (g_green_flashes_remaining > 0)
+                        g_green_flashes_remaining--;
+
+                    if (g_green_flashes_remaining == 0)
+                    {
+                        g_green_state = 0;
+                    }
+                    else
+                    {
+                        // Start next flash
+                        P1OUT |= BIT1;
+                        g_green_state = 1;
+                        g_green_tick  = GREEN_ON_TICKS;
+                    }
+                }
+            }
+        }
+
+        __no_operation();           // All real work done in ISRs + above
     }
 }
 
 /* ---------------- CLOCK: SMCLK = 8 MHz ---------------- */
 void initClock(void)
 {
-    FRCTL0   = FRCTLPW | NWAITS_1;
+    FRCTL0 = FRCTLPW | NWAITS_1;
     CSCTL0_H = CSKEY >> 8;
     CSCTL1   = DCOFSEL_3;           // 8 MHz
     CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
@@ -180,11 +292,11 @@ void initClock(void)
 /* ---------------- GPIO Setup ---------------- */
 void initGPIO(void)
 {
-    PM5CTL0 &= ~LOCKLPM5;           // Unlock GPIO (FRAM devices)
+    PM5CTL0 &= ~LOCKLPM5;           // Unlock GPIO
 
-    // LED on P1.0
-    P1DIR |= BIT0;
-    P1OUT &= ~BIT0;
+    // LEDs on P1.0 (red) and P1.1 (green)
+    P1DIR |= (BIT0 | BIT1);
+    P1OUT &= ~(BIT0 | BIT1);
 
     // --- ADC pins ---
     // A2 on P1.2
@@ -276,8 +388,7 @@ void initADC(void)
 
 void initTimer(void)
 {
-    // 8 MHz / 1600 = 5 kHz sampling (calmer than 10 kHz)
-    TA0CCR0  = 1600 - 1;
+    TA0CCR0  = 800 - 1;                       // 8 MHz / 800 = 10 kHz
     TA0CCTL0 = CCIE;
     TA0CTL   = TASSEL_2 | MC_1 | TACLR;
 }
@@ -308,38 +419,57 @@ __interrupt void ADC12_B_ISR(void)
         g_base_acc_A = g_base_acc_A - (g_base_acc_A >> BASE_SHIFT_A) + fast_A;
         uint16_t base_A = (uint16_t)(g_base_acc_A >> BASE_SHIFT_A);
 
-        // Dip depth (kept for info, not used for DAC here)
+        // Dip depth
         uint16_t delta_A = 0;
         if (base_A > fast_A)
             delta_A = (uint16_t)(base_A - fast_A);
 
-        // For DAC we just use the smoothed signal
-        uint16_t out_A_code = fast_A;
+        // ---------- non-linear gain for A ----------
+        uint32_t amp_delta_A = 0;
+        if (delta_A > DELTA_NOISE_THRESH)
+        {
+            if (delta_A <= SMALL_DELTA_THRESH)
+            {
+                // small / medium dips
+                amp_delta_A = (uint32_t)delta_A * SMALL_GAIN;
+            }
+            else
+            {
+                // bigger dips
+                amp_delta_A = (uint32_t)delta_A * DROP_GAIN;
+            }
+        }
 
-        // Optional LED indication: low when dipped
-        if (delta_A > DETECT_DELTA_CODES)
-            P1OUT |= BIT0;
-        else
-            P1OUT &= ~BIT0;
+        if (amp_delta_A > base_A) amp_delta_A = base_A;
 
-        // ======== DROP-MIN DETECTION – CHANNEL A (optional logging) ========
+        uint16_t out_A_code = (uint16_t)(base_A - amp_delta_A);
+
+        // *** RED LED BEHAVIOUR (UNCHANGED) ***
+        // LED on A: low when dipped
+        if (out_A_code < 2048U) P1OUT |= BIT0;
+        else                    P1OUT &= ~BIT0;
+
+        // ======== DROP-MIN DETECTION – CHANNEL A ========
         uint16_t thr_A = (base_A > DETECT_DELTA_CODES) ?
                          (uint16_t)(base_A - DETECT_DELTA_CODES) : 0;
 
         if (!g_inAnomaly_A)
         {
-            if (fast_A < thr_A)
+            // Not currently in a drop: check if we just went below threshold
+            if (out_A_code < thr_A)
             {
                 g_inAnomaly_A   = 1;
-                g_current_min_A = fast_A;
+                g_current_min_A = out_A_code;
             }
         }
         else
         {
-            if (fast_A < g_current_min_A)
-                g_current_min_A = fast_A;
+            // Already in a drop: update minimum
+            if (out_A_code < g_current_min_A)
+                g_current_min_A = out_A_code;
 
-            if (fast_A >= thr_A)
+            // Drop ends when we come back above threshold
+            if (out_A_code >= thr_A)
             {
                 if (g_drop_count_A < MAX_DROPS)
                     g_drop_mins_A[g_drop_count_A++] = g_current_min_A;
@@ -367,8 +497,23 @@ __interrupt void ADC12_B_ISR(void)
         if (base_B > fast_B)
             delta_B = (uint16_t)(base_B - fast_B);
 
-        // For DAC we just use smoothed signal
-        uint16_t out_B_code = fast_B;
+        // ---------- non-linear gain for B ----------
+        uint32_t amp_delta_B = 0;
+        if (delta_B > DELTA_NOISE_THRESH)
+        {
+            if (delta_B <= SMALL_DELTA_THRESH)
+            {
+                amp_delta_B = (uint32_t)delta_B * SMALL_GAIN;
+            }
+            else
+            {
+                amp_delta_B = (uint32_t)delta_B * DROP_GAIN;
+            }
+        }
+
+        if (amp_delta_B > base_B) amp_delta_B = base_B;
+
+        uint16_t out_B_code = (uint16_t)(base_B - amp_delta_B);
 
         // ======== DROP-MIN DETECTION – CHANNEL B ========
         uint16_t thr_B = (base_B > DETECT_DELTA_CODES) ?
@@ -376,24 +521,23 @@ __interrupt void ADC12_B_ISR(void)
 
         if (!g_inAnomaly_B)
         {
-            if (fast_B < thr_B)
+            if (out_B_code < thr_B)
             {
                 g_inAnomaly_B   = 1;
-                g_current_min_B = fast_B;
+                g_current_min_B = out_B_code;
             }
         }
         else
         {
-            if (fast_B < g_current_min_B)
-                g_current_min_B = fast_B;
+            if (out_B_code < g_current_min_B)
+                g_current_min_B = out_B_code;
 
-            if (fast_B >= thr_B)
+            if (out_B_code >= thr_B)
             {
-                // Store into ring/log (optional)
                 if (g_drop_count_B < MAX_DROPS)
                     g_drop_mins_B[g_drop_count_B++] = g_current_min_B;
 
-                // Make values available for TinyML in main loop
+                // Make this drop available to TinyML logic in main()
                 g_last_min_B   = g_current_min_B;
                 g_last_base_B  = base_B;
                 g_drop_ready_B = 1;
@@ -432,20 +576,20 @@ __interrupt void ADC12_B_ISR(void)
 }
 
 // ============================================================================
-//  TinyML Quadratic Model (frozen from Python)
+//  TinyML helper: estimate size from ADC codes (Channel B)
 // ============================================================================
-
-// Replace these with your final Python coefficients
-const float DROP_A = -2.6851f;   // a
-const float DROP_B = 10.5871f;   // b
-const float DROP_C = -0.0380f;   // c
-
-const float DROP_DV_MIN = 0.55f;
-const float DROP_DV_MAX = 1.80f;
-
-float estimate_drop_size_mm(float deltaV)
+float tinyml_estimate_size_from_codes(uint16_t base_code, uint16_t min_code)
 {
-    // Clamp deltaV to calibrated region
+    if (base_code <= min_code)
+        return 0.0f;
+
+    uint16_t delta_code = base_code - min_code;
+    float deltaV = (float)delta_code * ADC_CODE_TO_VOLTS;
+
+    if (deltaV < MIN_DV_FOR_EST)
+        return 0.0f;
+
+    // Clamp to calibrated delta-V range
     if (deltaV < DROP_DV_MIN) deltaV = DROP_DV_MIN;
     if (deltaV > DROP_DV_MAX) deltaV = DROP_DV_MAX;
 
@@ -453,35 +597,19 @@ float estimate_drop_size_mm(float deltaV)
                   + DROP_B * deltaV
                   + DROP_C;
 
-    // Clamp to trained size range (5–10 mm)
-    if (size_mm < 5.0f)  size_mm = 5.0f;
-    if (size_mm > 10.0f) size_mm = 10.0f;
+    if (size_mm < 0.0f)
+        size_mm = 0.0f;
 
     return size_mm;
 }
 
-// Convert ADC codes → volts and run the TinyML estimator
-void handle_drop_codes(uint16_t base_code, uint16_t min_code)
+// ============================================================================
+//  Schedule N green LED flashes (TinyML result)
+// ============================================================================
+void schedule_green_flashes(uint8_t flashes)
 {
-    if (base_code <= min_code)
-        return;
-
-    uint16_t delta_code = base_code - min_code;
-    float deltaV = (float)delta_code * ADC_CODE_TO_VOLTS;
-
-    if (deltaV < MIN_DV_FOR_EST)
-        return;
-
-    float size_mm = estimate_drop_size_mm(deltaV);
-
-    // Convert to integers for minimal printf
-    uint16_t delta_mV     = (uint16_t)(deltaV * 1000.0f + 0.5f);   // e.g. 0.95 V -> 950 mV
-    uint16_t size_mm_x10  = (uint16_t)(size_mm * 10.0f + 0.5f);    // e.g. 7.2 mm -> 72
-
-    // minimal printf: use %d only (no %u, no %f, no width)
-    // Example output: DROP,dV=950 mV,size=7.2 mm
-    printf("DROP,dV=%d mV,size=%d.%d mm\r\n",
-           (int)delta_mV,
-           (int)(size_mm_x10 / 10),
-           (int)(size_mm_x10 % 10));
+    // If a previous sequence is running, we just overwrite with the new one.
+    g_green_flashes_remaining = flashes;
+    g_green_state             = 0;
+    g_green_tick              = 0;
 }
